@@ -1,0 +1,57 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+// Get a free hosted Postgres database in seconds: `npx create-db`
+
+generator client {
+  provider = "prisma-client"
+  output   = "../app/generated/prisma"
+}
+
+datasource db {
+  provider = "postgresql"
+}
+
+/// An application: the unit that owns a config lineage and its records.
+model App {
+  id                    String   @id @default(uuid())
+  name                  String
+  ownerId               String
+  activeConfigVersionId String? // pointer to the live ConfigVersion
+  createdAt             DateTime @default(now())
+  updatedAt             DateTime @updatedAt
+  configVersions        ConfigVersion[]
+  records               Record[]
+
+  @@index([ownerId])
+}
+
+/// Immutable: publishing a new config inserts a new version and repoints App.activeConfigVersionId.
+model ConfigVersion {
+  id               String   @id @default(uuid())
+  appId            String
+  app              App      @relation(fields: [appId], references: [id], onDelete: Cascade)
+  version          Int
+  rawConfig        Json // exactly what was submitted
+  normalizedConfig Json // compiler output, guaranteed well-formed
+  diagnostics      Json // what the compiler repaired/dropped
+  createdAt        DateTime @default(now())
+
+  @@unique([appId, version])
+}
+
+/// All user data lives here; one generic table interpreted by the active config.
+model Record {
+  id        String   @id @default(uuid())
+  appId     String
+  app       App      @relation(fields: [appId], references: [id], onDelete: Cascade)
+  entity    String // entity name from the config
+  ownerId   String // user-scoping key
+  data      Json // validated/coerced record body
+  version   Int      @default(1) // schema version the row was written under
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // GIN index on `data` is added via raw SQL when filtering lands in Phase 4 — not needed now.
+  @@index([appId, entity, ownerId])
+}
