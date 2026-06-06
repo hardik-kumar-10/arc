@@ -2,8 +2,9 @@ import { AppError } from "./errors";
 import { fail } from "./envelope";
 import { logRequest } from "./logger";
 import { MAX_BODY_BYTES } from "./limits";
+import { enforceRateLimit } from "./rate-limit";
 import { getOwnerContext } from "@/server/auth/context";
-import { newRequestId } from "@/lib/ids";
+import { resolveRequestId } from "@/lib/ids";
 
 interface BaseContext {
   requestId: string;
@@ -52,7 +53,8 @@ export function withRoute(
   const { auth = true, maxBodyBytes = MAX_BODY_BYTES } = options;
 
   return async function (req, segment): Promise<Response> {
-    const requestId = newRequestId();
+    // One correlation id, end to end: reuse a well-formed inbound X-Request-Id, else generate one.
+    const requestId = resolveRequestId(req.headers.get("x-request-id"));
     const startedAt = Date.now();
     const path = new URL(req.url).pathname;
     let status = 500;
@@ -70,16 +72,25 @@ export function withRoute(
         throw new AppError("UNAUTHORIZED", "Authentication required");
       }
 
+      // Rate limit in one place, after auth, before the handler (writes only; reads exempt).
+      await enforceRateLimit(req, ownerId);
+
       const params = segment?.params ? await segment.params : {};
 
       // The overloads guarantee the caller's handler matches its declared auth mode; the
       // implementation invokes through the public (nullable) shape, which is the safe widening.
       const res = await (handler as PublicHandler)(req, { ownerId, requestId, params });
       status = res.status;
+      res.headers.set("x-request-id", requestId); // echo the correlation id on success
       return res;
     } catch (err) {
       const res = fail(err, requestId);
       status = res.status;
+      res.headers.set("x-request-id", requestId); // echo it on failures too
+      if (err instanceof AppError && err.code === "RATE_LIMITED") {
+        const retryAfterSec = (err.details as { retryAfterSec?: number } | undefined)?.retryAfterSec;
+        if (typeof retryAfterSec === "number") res.headers.set("retry-after", String(retryAfterSec));
+      }
       return res;
     } finally {
       logRequest({

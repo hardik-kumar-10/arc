@@ -35,4 +35,29 @@ describe("readJson", () => {
     expect(body.length).toBe(6);
     expect(await codeOf(() => readJson(post(body), 8))).toBe("PAYLOAD_TOO_LARGE");
   });
+
+  it("aborts mid-stream over the cap by CANCELLING the source (not draining it)", async () => {
+    let cancelled = false;
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        controller.enqueue(new Uint8Array(20)); // already over the cap of 8
+      },
+      pull(controller) {
+        // A reader that kept draining would consume an unbounded tail here.
+        controller.enqueue(new Uint8Array(1000));
+      },
+      cancel() {
+        cancelled = true; // the reader signalled "stop" early
+      },
+    });
+    const req = new Request("http://localhost/x", {
+      method: "POST",
+      body: stream,
+      // @ts-expect-error — Node/undici requires duplex for a stream body
+      duplex: "half",
+    });
+
+    expect(await codeOf(() => readJson(req, 8))).toBe("PAYLOAD_TOO_LARGE");
+    expect(cancelled).toBe(true); // aborted via cancel(), did not read to completion
+  });
 });

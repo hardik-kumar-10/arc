@@ -12,6 +12,7 @@ import { readJson } from "@/server/http/read-json";
 import { AppError } from "@/server/http/errors";
 import { recordService } from "@/server/records/service";
 import { readResponseMeta } from "@/server/records/serialize";
+import { runWithIdempotency, type IdempotentResult } from "@/server/http/idempotency";
 import { oneParam } from "@/lib/params";
 
 /** Collapse the optional catch-all into a single id, or null for the collection route. */
@@ -30,8 +31,19 @@ export const POST = withRoute(async (req, ctx) => {
     throw new AppError("BAD_REQUEST", "Cannot POST to a specific record id");
   }
   const body = await readJson(req);
-  const record = await recordService.create({ ownerId: ctx.ownerId, appId, entity, body });
-  return ok(record, { status: 201, meta: readResponseMeta(record), requestId: ctx.requestId });
+
+  // Opt-in idempotency: a create carrying an `Idempotency-Key` is safe to retry. Absent header ->
+  // behaves exactly as before.
+  const idempotencyKey = req.headers.get("idempotency-key") || undefined;
+  const produce = async (): Promise<IdempotentResult> => {
+    const record = await recordService.create({ ownerId: ctx.ownerId, appId, entity, body });
+    return { status: 201, data: record, meta: readResponseMeta(record) };
+  };
+  const out = idempotencyKey
+    ? await runWithIdempotency({ ownerId: ctx.ownerId, key: idempotencyKey, body }, produce)
+    : await produce();
+
+  return ok(out.data, { status: out.status, meta: out.meta, requestId: ctx.requestId });
 });
 
 export const GET = withRoute(async (req, ctx) => {
