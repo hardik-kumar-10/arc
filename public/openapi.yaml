@@ -1,0 +1,791 @@
+openapi: 3.1.0
+info:
+  title: arc Backend API
+  version: 0.1.0
+  description: |
+    HTTP API for the **arc** config-driven application backend.
+
+    ## Conventions
+
+    - **Auth:** Clerk session. Every endpoint except `GET /api/health` requires an
+      authenticated owner; identity is resolved server-side via Clerk (session cookie set by
+      the proxy/middleware, or a bearer token). Unauthenticated requests get `401 UNAUTHORIZED`.
+    - **Owner scoping:** all resources are scoped to the authenticated owner. Accessing an app,
+      config version, or record you do not own returns `404 NOT_FOUND` (existence is never leaked).
+    - **Response envelope:** every response is wrapped. Success → `{ ok: true, data, meta?, requestId }`.
+      Failure → `{ ok: false, error: { code, message, details? }, requestId }`.
+    - **Correlation:** every response echoes an `x-request-id` header. Send your own via the
+      `X-Request-Id` request header to reuse it.
+    - **Rate limiting:** write verbs (POST/PATCH/DELETE) are rate limited per owner. Reads are
+      exempt. On limit, returns `429 RATE_LIMITED` with a `Retry-After` header (seconds).
+    - **Body size:** request bodies above the server limit return `413 PAYLOAD_TOO_LARGE`.
+
+    ## Generic data CRUD
+
+    The `/api/apps/{appId}/data/{entity}` routes are a single generic handler that serves
+    **every entity defined in the app's active published config**. The shape of a record's
+    user fields is determined by that config, so record bodies are described generically
+    (`additionalProperties`) here.
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: /
+    description: Same-origin (relative)
+
+security:
+  - clerkSession: []
+
+tags:
+  - name: System
+    description: Health and identity.
+  - name: Apps
+    description: Manage apps owned by the caller.
+  - name: Config
+    description: Publish and inspect an app's config and its version history.
+  - name: Records
+    description: Generic owner-scoped CRUD over entities defined in the active config.
+
+paths:
+  /api/health:
+    get:
+      tags: [System]
+      summary: Liveness check
+      description: Public, unauthenticated. Returns server status and time.
+      security: []
+      responses:
+        "200":
+          description: Service is up.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [status, time]
+                        properties:
+                          status: { type: string, example: ok }
+                          time: { type: string, format: date-time }
+
+  /api/me:
+    get:
+      tags: [System]
+      summary: Current owner identity
+      responses:
+        "200":
+          description: The authenticated owner's id.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [ownerId]
+                        properties:
+                          ownerId: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+
+  /api/apps:
+    get:
+      tags: [Apps]
+      summary: List the caller's apps
+      responses:
+        "200":
+          description: Apps owned by the caller.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+    post:
+      tags: [Apps]
+      summary: Create an app
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: { type: string, minLength: 1, example: My App }
+      responses:
+        "201":
+          description: App created.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/App" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/apps/{appId}/config:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    get:
+      tags: [Config]
+      summary: Get the active config
+      description: The active normalized config, its version, and compile diagnostics. Returns nulls when nothing is published yet.
+      responses:
+        "200":
+          description: Active config (or empty state).
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [config, version, diagnostics]
+                        properties:
+                          config:
+                            oneOf:
+                              - $ref: "#/components/schemas/AppConfig"
+                              - type: "null"
+                          version:
+                            oneOf:
+                              - type: integer
+                              - type: "null"
+                          diagnostics:
+                            type: array
+                            items: { $ref: "#/components/schemas/Diagnostic" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Config]
+      summary: Publish a config
+      description: |
+        Compiles and publishes a new config version. **Lenient by default**: the config is always
+        persisted and diagnostics are returned. With `strict: true`, any blocking (error-level)
+        diagnostic surfaces `422 CONFIG_INVALID` and **nothing is persisted**.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [config]
+              properties:
+                config:
+                  description: The raw config payload (compiled server-side; arbitrary shape).
+                  $ref: "#/components/schemas/AnyValue"
+                strict:
+                  type: boolean
+                  default: false
+                  description: Reject (without persisting) if any error-level diagnostic is produced.
+      responses:
+        "200":
+          description: Config published.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [versionId, version, diagnostics, config]
+                        properties:
+                          versionId: { type: string }
+                          version: { type: integer }
+                          diagnostics:
+                            type: array
+                            items: { $ref: "#/components/schemas/Diagnostic" }
+                          config: { $ref: "#/components/schemas/AppConfig" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422":
+          description: Invalid request envelope (`VALIDATION_ERROR`) or, in strict mode, a blocking config (`CONFIG_INVALID`).
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/apps/{appId}/config/versions:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+    get:
+      tags: [Config]
+      summary: List config version history
+      description: Version metadata, newest first.
+      responses:
+        "200":
+          description: Version history metadata.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/ConfigVersionMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/apps/{appId}/config/versions/{version}:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+      - name: version
+        in: path
+        required: true
+        description: A positive integer version number.
+        schema: { type: integer, minimum: 1 }
+    get:
+      tags: [Config]
+      summary: Get a specific config version
+      responses:
+        "200":
+          description: The full normalized config for that version.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [config, version, diagnostics]
+                        properties:
+                          config: { $ref: "#/components/schemas/AppConfig" }
+                          version: { type: integer }
+                          diagnostics:
+                            type: array
+                            items: { $ref: "#/components/schemas/Diagnostic" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+
+  /api/apps/{appId}/data/{entity}:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+      - $ref: "#/components/parameters/Entity"
+    get:
+      tags: [Records]
+      summary: List records
+      description: |
+        Tolerant query parsing — bad params clamp or are ignored, never 4xx. Supports pagination,
+        sorting on system fields, and equality filters on any defined field
+        (`?field=value` or `?filter[field]=value`).
+      parameters:
+        - name: page
+          in: query
+          schema: { type: integer, minimum: 1, default: 1 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 20 }
+        - name: sort
+          in: query
+          description: "`field:dir` where field is one of createdAt|updatedAt|id and dir is asc|desc."
+          schema: { type: string, example: "createdAt:desc" }
+        - name: filter
+          in: query
+          description: Equality filter, e.g. `filter[status]=open`. Plain `?field=value` also works for defined fields.
+          style: deepObject
+          explode: true
+          schema:
+            type: object
+            additionalProperties: true
+      responses:
+        "200":
+          description: A page of records.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: array
+                        items: { $ref: "#/components/schemas/Record" }
+                      meta: { $ref: "#/components/schemas/ListMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    post:
+      tags: [Records]
+      summary: Create a record
+      description: |
+        Strict-but-coercing validation against the entity's schema. Reference fields must point to
+        existing owned records. Supports opt-in idempotency via the `Idempotency-Key` header — a
+        retried create with the same key and body returns the original result.
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          description: Opaque key making the create safe to retry.
+          schema: { type: string }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecordInput" }
+      responses:
+        "201":
+          description: Record created.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Record" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404":
+          description: App has no active config, or the entity is unknown (`ENTITY_UNKNOWN`).
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+        "409": { $ref: "#/components/responses/Conflict" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+  /api/apps/{appId}/data/{entity}/{id}:
+    parameters:
+      - $ref: "#/components/parameters/AppId"
+      - $ref: "#/components/parameters/Entity"
+      - name: id
+        in: path
+        required: true
+        description: The record id.
+        schema: { type: string }
+    get:
+      tags: [Records]
+      summary: Get a record by id
+      responses:
+        "200":
+          description: The record (with drift meta if it was migrated-on-read).
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Record" }
+                      meta: { $ref: "#/components/schemas/DriftMeta" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+    patch:
+      tags: [Records]
+      summary: Update a record
+      description: Partial update — only sent fields overwrite. Drifted rows are migrated-on-write.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/RecordInput" }
+      responses:
+        "200":
+          description: Record updated.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data: { $ref: "#/components/schemas/Record" }
+                      meta: { $ref: "#/components/schemas/DriftMeta" }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "413": { $ref: "#/components/responses/PayloadTooLarge" }
+        "422": { $ref: "#/components/responses/ValidationError" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+    delete:
+      tags: [Records]
+      summary: Delete a record
+      responses:
+        "200":
+          description: Record deleted.
+          headers:
+            x-request-id: { $ref: "#/components/headers/RequestId" }
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: "#/components/schemas/Envelope"
+                  - type: object
+                    properties:
+                      data:
+                        type: object
+                        required: [id]
+                        properties:
+                          id: { type: string }
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "429": { $ref: "#/components/responses/RateLimited" }
+
+components:
+  securitySchemes:
+    clerkSession:
+      type: http
+      scheme: bearer
+      description: |
+        Clerk-issued session. In the browser the session cookie set by the Clerk proxy is used
+        automatically; programmatic clients send a bearer token. Identity is resolved server-side.
+
+  headers:
+    RequestId:
+      description: Correlation id echoed on every response.
+      schema: { type: string }
+
+  parameters:
+    AppId:
+      name: appId
+      in: path
+      required: true
+      description: The app id (owner-scoped).
+      schema: { type: string }
+    Entity:
+      name: entity
+      in: path
+      required: true
+      description: An entity name defined in the app's active config (case-sensitive).
+      schema: { type: string }
+
+  schemas:
+    AnyValue:
+      description: Any JSON value.
+      nullable: true
+
+    Envelope:
+      type: object
+      required: [ok, data, requestId]
+      properties:
+        ok: { type: boolean, enum: [true] }
+        data: {}
+        meta: { type: object, additionalProperties: true }
+        requestId: { type: string }
+
+    ErrorEnvelope:
+      type: object
+      required: [ok, error, requestId]
+      properties:
+        ok: { type: boolean, enum: [false] }
+        requestId: { type: string }
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code: { $ref: "#/components/schemas/ErrorCode" }
+            message: { type: string }
+            details:
+              description: Optional structured detail (e.g. fieldErrors/formErrors or diagnostics).
+              $ref: "#/components/schemas/AnyValue"
+
+    ErrorCode:
+      type: string
+      enum:
+        - BAD_REQUEST
+        - UNAUTHORIZED
+        - FORBIDDEN
+        - NOT_FOUND
+        - ENTITY_UNKNOWN
+        - CONFLICT
+        - PAYLOAD_TOO_LARGE
+        - VALIDATION_ERROR
+        - CONFIG_INVALID
+        - RATE_LIMITED
+        - INTERNAL
+
+    App:
+      type: object
+      required: [id, name, ownerId, activeConfigVersionId, createdAt, updatedAt]
+      properties:
+        id: { type: string }
+        name: { type: string }
+        ownerId: { type: string }
+        activeConfigVersionId:
+          oneOf:
+            - type: string
+            - type: "null"
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+
+    Diagnostic:
+      type: object
+      required: [level, code, path, message]
+      properties:
+        level: { type: string, enum: [error, warning, info] }
+        code: { type: string, example: FIELD_UNKNOWN_TYPE }
+        path: { type: string, example: "entities[2].fields[0].type" }
+        message: { type: string }
+
+    ConfigVersionMeta:
+      type: object
+      required: [id, version, createdAt, diagnosticCounts]
+      properties:
+        id: { type: string }
+        version: { type: integer }
+        createdAt: { type: string, format: date-time }
+        diagnosticCounts:
+          type: object
+          required: [error, warning, info]
+          properties:
+            error: { type: integer }
+            warning: { type: integer }
+            info: { type: integer }
+
+    FieldType:
+      type: string
+      enum: [string, number, boolean, date, enum, reference]
+
+    FieldDef:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        type: { $ref: "#/components/schemas/FieldType" }
+        required: { type: boolean, default: false }
+        default: { $ref: "#/components/schemas/AnyValue" }
+        values:
+          type: array
+          description: Present only when type is `enum`.
+          items: { type: string }
+        ref:
+          type: string
+          description: Target entity name. Present only when type is `reference`.
+
+    EntityDef:
+      type: object
+      required: [name, fields]
+      properties:
+        name: { type: string }
+        fields:
+          type: array
+          items: { $ref: "#/components/schemas/FieldDef" }
+
+    ComponentNode:
+      type: object
+      required: [type]
+      properties:
+        type: { type: string }
+        props: { type: object, additionalProperties: true }
+        children:
+          type: array
+          items: { $ref: "#/components/schemas/ComponentNode" }
+
+    PageDef:
+      type: object
+      required: [path]
+      properties:
+        path: { type: string }
+        title: { type: string }
+        components:
+          type: array
+          items: { $ref: "#/components/schemas/ComponentNode" }
+
+    WorkflowDef:
+      type: object
+      required: [trigger, actions]
+      properties:
+        trigger:
+          type: object
+          required: [event, entity]
+          properties:
+            event: { type: string, enum: [onCreate, onUpdate, onDelete] }
+            entity: { type: string }
+        condition: { $ref: "#/components/schemas/AnyValue" }
+        actions:
+          type: array
+          items:
+            type: object
+            required: [type]
+            properties:
+              type: { type: string }
+            additionalProperties: true
+
+    AppConfig:
+      type: object
+      required: [app, entities, workflows, pages]
+      properties:
+        app:
+          type: object
+          required: [name]
+          properties:
+            name: { type: string }
+        entities:
+          type: array
+          items: { $ref: "#/components/schemas/EntityDef" }
+        workflows:
+          type: array
+          items: { $ref: "#/components/schemas/WorkflowDef" }
+        pages:
+          type: array
+          items: { $ref: "#/components/schemas/PageDef" }
+
+    RecordInput:
+      type: object
+      description: |
+        User-defined fields for the entity, as declared in the active config. Field names and types
+        are config-driven, so the concrete shape varies per entity. System fields
+        (id, ownerId, version, createdAt, updatedAt) are managed by the server and ignored on input.
+      additionalProperties: true
+
+    Record:
+      type: object
+      description: |
+        Flat record: server-managed system fields plus the entity's user fields at the top level.
+      required: [id, createdAt, updatedAt, version]
+      properties:
+        id: { type: string }
+        createdAt: { type: string, format: date-time }
+        updatedAt: { type: string, format: date-time }
+        version: { type: integer, description: Config version the record conforms to. }
+      additionalProperties: true
+
+    ListMeta:
+      type: object
+      required: [page, limit, total]
+      properties:
+        page: { type: integer }
+        limit: { type: integer }
+        total: { type: integer }
+        driftedCount:
+          type: integer
+          description: Present only when one or more rows in the page were drifted relative to the active version.
+
+    DriftMeta:
+      type: object
+      description: Present only when the returned record was migrated relative to the active config version.
+      properties:
+        drift:
+          type: array
+          items: { type: object, additionalProperties: true }
+        writtenVersion: { type: integer }
+        activeVersion: { type: integer }
+        workflows:
+          type: object
+          properties:
+            ran: { type: integer }
+            skipped: { type: integer }
+            failed: { type: integer }
+      additionalProperties: true
+
+  responses:
+    BadRequest:
+      description: Malformed request (`BAD_REQUEST`).
+      headers:
+        x-request-id: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: Authentication required (`UNAUTHORIZED`).
+      headers:
+        x-request-id: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: Resource not found or not owned by the caller (`NOT_FOUND`).
+      headers:
+        x-request-id: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: Conflict, e.g. an idempotency-key replay with a mismatched body (`CONFLICT`).
+      headers:
+        x-request-id: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    PayloadTooLarge:
+      description: Request body too large (`PAYLOAD_TOO_LARGE`).
+      headers:
+        x-request-id: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    ValidationError:
+      description: Validation failed (`VALIDATION_ERROR`); `details` carries fieldErrors/formErrors.
+      headers:
+        x-request-id: { $ref: "#/components/headers/RequestId" }
+      content:
+        application/json:
+          schema:
+            allOf:
+              - $ref: "#/components/schemas/ErrorEnvelope"
+              - type: object
+                properties:
+                  error:
+                    type: object
+                    properties:
+                      details:
+                        type: object
+                        properties:
+                          fieldErrors:
+                            type: object
+                            additionalProperties:
+                              type: array
+                              items: { type: string }
+                          formErrors:
+                            type: array
+                            items: { type: string }
+    RateLimited:
+      description: Too many requests (`RATE_LIMITED`).
+      headers:
+        x-request-id: { $ref: "#/components/headers/RequestId" }
+        Retry-After:
+          description: Seconds to wait before retrying.
+          schema: { type: integer }
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }

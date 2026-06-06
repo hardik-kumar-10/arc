@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>arc API Reference</title>
+    <style>
+      body { margin: 0; }
+    </style>
+  </head>
+  <body>
+    <!-- Scalar reads the OpenAPI document served statically from /openapi.yaml -->
+    <div id="app"></div>
+    <script src="https://cdn.jsdelivr.net/npm/@scalar/api-reference"></script>
+    <script>
+      Scalar.createApiReference('#app', {
+        url: '/openapi.yaml',
+        theme: 'default',
+        layout: 'modern',
+        hideClientButton: false,
+        // Pre-seed the auth panel so "Try it" requests carry a bearer token.
+        authentication: { preferredSecurityScheme: 'clerkSession' },
+      });
+    </script>
+  </body>
+</html>
