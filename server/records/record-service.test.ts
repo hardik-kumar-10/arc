@@ -9,6 +9,8 @@ import { AppError } from "@/server/http/errors";
 import type { AppConfig } from "@/server/config/types";
 import { RecordService, type ActiveConfigReader } from "./record-service";
 import type { ListQuery, RecordRepository, StoredRecord } from "./record-repository";
+import { readDriftMeta } from "./serialize";
+import type { DriftNote } from "./project";
 
 const APP_ID = "app_1";
 const ACTIVE_VERSION = 3;
@@ -370,5 +372,177 @@ describe("list tolerance", () => {
       searchParams: sp("priority=not-a-number"),
     });
     expect(res.items).toHaveLength(2); // filter dropped, all returned
+  });
+});
+
+// ---- Phase 5: schema-drift tolerance ---------------------------------------
+//
+// A row is written under a "v1" config (stamped version 1), then the reader is repointed at a "v2"
+// config (version 2) sharing the SAME repo. Reads must project the v1 row onto the v2 schema and
+// never error. The drift envelope `meta` rides a Symbol side-channel read via `readDriftMeta`.
+
+const ENTITY = "Item";
+
+const V1: AppConfig = {
+  app: { name: "Drift" },
+  entities: [
+    {
+      name: ENTITY,
+      fields: [
+        { name: "name", type: "string", required: true },
+        { name: "color", type: "enum", values: ["red", "blue"] },
+        { name: "oldType", type: "string" }, // becomes number in v2
+        { name: "legacy", type: "string" }, // removed in v2
+      ],
+    },
+  ],
+  workflows: [],
+  pages: [],
+};
+
+const V2: AppConfig = {
+  app: { name: "Drift" },
+  entities: [
+    {
+      name: ENTITY,
+      fields: [
+        { name: "name", type: "string", required: true }, // unchanged
+        { name: "color", type: "enum", values: ["red", "green"] }, // "blue" no longer allowed
+        { name: "oldType", type: "number" }, // type changed from string
+        { name: "qty", type: "number", required: true }, // added, required, no default
+        { name: "status", type: "string", default: "active" }, // added, has default
+        // "legacy" removed
+      ],
+    },
+  ],
+  workflows: [],
+  pages: [],
+};
+
+const readerFor = (config: AppConfig, version: number): ActiveConfigReader => ({
+  async getActive() {
+    return { config, version };
+  },
+});
+
+const driftOf = (record: { [k: string]: unknown }): DriftNote[] => {
+  const meta = readDriftMeta(record as never);
+  return (meta?.drift as DriftNote[] | undefined) ?? [];
+};
+
+describe("Phase 5 drift tolerance", () => {
+  let sharedRepo: RecordRepository;
+  let v1: RecordService;
+  let v2: RecordService;
+
+  beforeEach(() => {
+    sharedRepo = makeRepo();
+    v1 = new RecordService(readerFor(V1, 1), sharedRepo);
+    v2 = new RecordService(readerFor(V2, 2), sharedRepo);
+  });
+
+  const writeV1 = () =>
+    v1.create({
+      ownerId: USER_A,
+      appId: APP_ID,
+      entity: ENTITY,
+      body: { name: "Widget", color: "blue", oldType: "123", legacy: "drop-me" },
+    });
+
+  it("get projects a v1 row onto the v2 schema, reports drift, never errors", async () => {
+    const created = await writeV1();
+    expect(created.version).toBe(1);
+
+    const got = await v2.get({ ownerId: USER_A, appId: APP_ID, entity: ENTITY, id: created.id });
+
+    // projected data conforms to v2
+    expect(got.name).toBe("Widget"); // unchanged
+    expect(got.color).toBeNull(); // "blue" no longer allowed, no default -> null
+    expect(got.oldType).toBe(123); // string -> number coerced
+    expect(got.qty).toBeNull(); // added required, no default -> null (read still succeeds)
+    expect(got.status).toBe("active"); // added with default -> backfilled
+    expect("legacy" in got).toBe(false); // removed field dropped
+
+    const codes = driftOf(got).map((n) => n.code).sort();
+    expect(codes).toEqual(
+      ["ENUM_VALUE_INVALID", "FIELD_BACKFILLED_DEFAULT", "FIELD_BACKFILLED_NULL", "FIELD_COERCED", "FIELD_DROPPED_ON_READ"].sort(),
+    );
+
+    const meta = readDriftMeta(got as never);
+    expect(meta?.writtenVersion).toBe(1);
+    expect(meta?.activeVersion).toBe(2);
+  });
+
+  it("list reports driftedCount and leaves conforming rows untouched", async () => {
+    await writeV1(); // drifted row (version 1)
+    const conforming = await v2.create({
+      ownerId: USER_A,
+      appId: APP_ID,
+      entity: ENTITY,
+      body: { name: "Fresh", color: "red", oldType: 9, qty: 2 },
+    });
+    expect(conforming.version).toBe(2);
+
+    const res = await v2.list({ ownerId: USER_A, appId: APP_ID, entity: ENTITY, searchParams: sp() });
+    expect(res.items).toHaveLength(2);
+    expect(res.meta.driftedCount).toBe(1);
+
+    // list never inlines per-item notes into the data shape
+    for (const item of res.items) {
+      expect("drift" in item).toBe(false);
+    }
+    // the conforming row is byte-identical to its create output (status defaulted, etc.)
+    const fresh = res.items.find((i) => i.name === "Fresh");
+    expect(fresh?.status).toBe("active");
+    expect(fresh?.qty).toBe(2);
+  });
+
+  it("update project-then-merges: re-stamps to the active version with a conforming row", async () => {
+    const created = await writeV1();
+
+    const updated = await v2.update({
+      ownerId: USER_A,
+      appId: APP_ID,
+      entity: ENTITY,
+      id: created.id,
+      body: { name: "Renamed" },
+    });
+
+    // patch applied; existing row migrated onto v2 and re-stamped truthfully
+    expect(updated.name).toBe("Renamed");
+    expect(updated.version).toBe(2); // re-stamped to active
+    expect(updated.color).toBeNull(); // migrated
+    expect(updated.oldType).toBe(123); // migrated/coerced
+    expect(updated.qty).toBeNull(); // missing-required backfilled to null, edit still succeeds
+    expect(updated.status).toBe("active"); // default backfilled
+    expect("legacy" in updated).toBe(false); // removed key gone
+
+    // the update reports the migration drift of the EXISTING row
+    expect(driftOf(updated).length).toBeGreaterThan(0);
+
+    // a subsequent read is now conforming (same version) -> no drift
+    const reread = await v2.get({ ownerId: USER_A, appId: APP_ID, entity: ENTITY, id: created.id });
+    expect(reread.version).toBe(2);
+    expect(driftOf(reread)).toHaveLength(0);
+  });
+
+  it("conforming records carry no drift meta (regression guard vs Phase 4)", async () => {
+    const created = await v2.create({
+      ownerId: USER_A,
+      appId: APP_ID,
+      entity: ENTITY,
+      body: { name: "Clean", color: "green", oldType: 1, qty: 1 },
+    });
+    const got = await v2.get({ ownerId: USER_A, appId: APP_ID, entity: ENTITY, id: created.id });
+    expect(readDriftMeta(got as never)).toBeUndefined();
+  });
+
+  it("entity removed from the active config -> ENTITY_UNKNOWN (not raw passthrough)", async () => {
+    const created = await writeV1();
+    const empty: AppConfig = { app: { name: "Drift" }, entities: [], workflows: [], pages: [] };
+    const v3 = new RecordService(readerFor(empty, 3), sharedRepo);
+    await expect(
+      v3.get({ ownerId: USER_A, appId: APP_ID, entity: ENTITY, id: created.id }),
+    ).rejects.toMatchObject({ code: "ENTITY_UNKNOWN" });
   });
 });

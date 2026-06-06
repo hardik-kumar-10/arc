@@ -9,8 +9,10 @@ import { AppError } from "@/server/http/errors";
 import type { AppConfig, EntityDef, FieldDef } from "@/server/config/types";
 import { buildEntityValidator } from "@/server/validation/build-validator";
 import { baseFieldSchema } from "@/server/validation/field-schemas";
-import type { ListQuery, RecordRepository, SortableField } from "./record-repository";
-import { serializeRecord, type SerializedRecord } from "./serialize";
+import { projectRecordData, type DriftNote, type ProjectionResult } from "./project";
+import type { ListQuery, RecordRepository, SortableField, StoredRecord } from "./record-repository";
+import { attachDriftMeta, serializeRecord, type SerializedRecord } from "./serialize";
+import { toStoredData, toStoredRepr } from "./value-repr";
 
 /** Narrow reader (not the whole ConfigService): the active normalized config + its version. */
 export interface ActiveConfigReader {
@@ -55,7 +57,7 @@ export class RecordService {
       appId: input.appId,
       entity: input.entity,
       ownerId: input.ownerId,
-      data: result.data,
+      data: toStoredData(result.data), // persist in stored representation (dates -> ISO), by construction
       version,
     });
     return serializeRecord(row);
@@ -64,7 +66,7 @@ export class RecordService {
   // ---- get ------------------------------------------------------------------
 
   async get(input: { ownerId: string; appId: string; entity: string; id: string }): Promise<SerializedRecord> {
-    await this.resolve(input);
+    const { entityDef, version } = await this.resolve(input);
     const row = await this.repo.getById({
       appId: input.appId,
       entity: input.entity,
@@ -72,7 +74,10 @@ export class RecordService {
       id: input.id,
     });
     if (!row) throw new AppError("NOT_FOUND", "Record not found");
-    return serializeRecord(row);
+
+    const projected = this.project(row, entityDef, version);
+    const serialized = serializeRecord({ ...row, data: projected.data });
+    return this.withDrift(serialized, projected.notes, row.version, version);
   }
 
   // ---- list -----------------------------------------------------------------
@@ -82,8 +87,11 @@ export class RecordService {
     appId: string;
     entity: string;
     searchParams: URLSearchParams;
-  }): Promise<{ items: SerializedRecord[]; meta: { page: number; limit: number; total: number } }> {
-    const { entityDef } = await this.resolve(input);
+  }): Promise<{
+    items: SerializedRecord[];
+    meta: { page: number; limit: number; total: number; driftedCount?: number };
+  }> {
+    const { entityDef, version } = await this.resolve(input);
     const query = this.parseListQuery(input.searchParams, entityDef);
 
     const { items, total } = await this.repo.list({
@@ -93,9 +101,18 @@ export class RecordService {
       query,
     });
 
+    let driftedCount = 0;
+    const projectedItems = items.map((row) => {
+      const projected = this.project(row, entityDef, version);
+      if (projected.notes.length > 0) driftedCount += 1;
+      // Keep the list shape lean: projected data only, never per-item notes (those belong to `get`).
+      return serializeRecord({ ...row, data: projected.data });
+    });
+
     return {
-      items: items.map(serializeRecord),
-      meta: { page: query.page, limit: query.limit, total },
+      items: projectedItems,
+      // Only surface driftedCount when it matters, so clean lists stay byte-identical to Phase 4.
+      meta: { page: query.page, limit: query.limit, total, ...(driftedCount > 0 ? { driftedCount } : {}) },
     };
   }
 
@@ -118,6 +135,10 @@ export class RecordService {
     });
     if (!existing) throw new AppError("NOT_FOUND", "Record not found");
 
+    // Project the EXISTING row onto the current schema first, so the version re-stamp below is
+    // honest: a drifted row is migrated-on-write (removed keys gone, missing keys backfilled).
+    const projected = this.project(existing, entityDef, version);
+
     const result = buildEntityValidator(entityDef).validate(input.body, "update");
     if (!result.ok) {
       throw new AppError("VALIDATION_ERROR", "Validation failed", {
@@ -128,8 +149,10 @@ export class RecordService {
 
     await this.checkReferences(input, entityDef, result.data);
 
-    // Merge: only the sent fields overwrite; update mode injects no defaults (Phase 3 contract).
-    const merged = { ...existing.data, ...result.data };
+    // Merge over the PROJECTED data: only sent fields overwrite; update mode injects no defaults.
+    // We deliberately do NOT re-validate the merged object in create mode — a drifted row missing a
+    // now-required field is backfilled to null and the edit still succeeds (lazy migration on write).
+    const merged = { ...projected.data, ...toStoredData(result.data) };
 
     const row = await this.repo.update({
       appId: input.appId,
@@ -137,10 +160,11 @@ export class RecordService {
       ownerId: input.ownerId,
       id: input.id,
       data: merged,
-      version, // re-stamp to the version the row was just validated under
+      version, // re-stamp to the active version — now truthful, the stored row conforms structurally
     });
     if (!row) throw new AppError("NOT_FOUND", "Record not found");
-    return serializeRecord(row);
+    // Report the existing row's drift so the caller learns it was migrated-on-write.
+    return this.withDrift(serializeRecord(row), projected.notes, existing.version, version);
   }
 
   // ---- delete ---------------------------------------------------------------
@@ -158,6 +182,27 @@ export class RecordService {
   }
 
   // ---- internals ------------------------------------------------------------
+
+  /**
+   * Project a stored row onto the current schema. Fast-path: a row written under the active version
+   * conforms by construction, so projection is skipped — a pure perf win that is behavior-equivalent
+   * to always projecting (projection is idempotent on conforming data).
+   */
+  private project(row: StoredRecord, entityDef: EntityDef, version: number): ProjectionResult {
+    if (row.version === version) return { data: row.data, notes: [] };
+    return projectRecordData(row.data, entityDef);
+  }
+
+  /** Attach drift meta to a serialized record only when the row actually drifted (else: no meta). */
+  private withDrift(
+    record: SerializedRecord,
+    notes: DriftNote[],
+    writtenVersion: number,
+    activeVersion: number,
+  ): SerializedRecord {
+    if (notes.length === 0) return record;
+    return attachDriftMeta(record, { drift: notes, writtenVersion, activeVersion });
+  }
 
   /** Resolve the active config + the requested entity (exact-case). */
   private async resolve(input: ResolveInput): Promise<{ config: AppConfig; version: number; entityDef: EntityDef }> {
@@ -247,9 +292,8 @@ export class RecordService {
 
       const parsed = baseFieldSchema(field).safeParse(raw);
       if (!parsed.success) continue; // uncoercible -> drop this one filter
-      // JSONB stores dates as ISO strings; normalize so equality matches storage.
-      const value = parsed.data instanceof Date ? parsed.data.toISOString() : parsed.data;
-      filters.push({ field: name, value });
+      // JSONB stores dates as ISO strings; normalize so equality matches storage (shared rule).
+      filters.push({ field: name, value: toStoredRepr(parsed.data) });
     }
     return filters.length > 0 ? filters : undefined;
   }
