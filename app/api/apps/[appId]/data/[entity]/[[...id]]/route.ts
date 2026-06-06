@@ -11,7 +11,7 @@ import { ok } from "@/server/http/envelope";
 import { readJson } from "@/server/http/read-json";
 import { AppError } from "@/server/http/errors";
 import { recordService } from "@/server/records/service";
-import { readDriftMeta } from "@/server/records/serialize";
+import { readResponseMeta } from "@/server/records/serialize";
 import { oneParam } from "@/lib/params";
 
 /** Collapse the optional catch-all into a single id, or null for the collection route. */
@@ -31,7 +31,7 @@ export const POST = withRoute(async (req, ctx) => {
   }
   const body = await readJson(req);
   const record = await recordService.create({ ownerId: ctx.ownerId, appId, entity, body });
-  return ok(record, { status: 201, requestId: ctx.requestId });
+  return ok(record, { status: 201, meta: readResponseMeta(record), requestId: ctx.requestId });
 });
 
 export const GET = withRoute(async (req, ctx) => {
@@ -41,7 +41,7 @@ export const GET = withRoute(async (req, ctx) => {
 
   if (target.kind === "item") {
     const record = await recordService.get({ ownerId: ctx.ownerId, appId, entity, id: target.id });
-    return ok(record, { meta: readDriftMeta(record), requestId: ctx.requestId });
+    return ok(record, { meta: readResponseMeta(record), requestId: ctx.requestId });
   }
 
   const { searchParams } = new URL(req.url);
@@ -58,7 +58,7 @@ export const PATCH = withRoute(async (req, ctx) => {
   }
   const body = await readJson(req);
   const record = await recordService.update({ ownerId: ctx.ownerId, appId, entity, id: target.id, body });
-  return ok(record, { meta: readDriftMeta(record), requestId: ctx.requestId });
+  return ok(record, { meta: readResponseMeta(record), requestId: ctx.requestId });
 });
 
 export const DELETE = withRoute(async (_req, ctx) => {
@@ -69,5 +69,5 @@ export const DELETE = withRoute(async (_req, ctx) => {
     throw new AppError("BAD_REQUEST", "DELETE requires a record id");
   }
   const result = await recordService.delete({ ownerId: ctx.ownerId, appId, entity, id: target.id });
-  return ok(result, { requestId: ctx.requestId });
+  return ok(result, { meta: readResponseMeta(result), requestId: ctx.requestId });
 });

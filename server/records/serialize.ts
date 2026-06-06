@@ -25,25 +25,37 @@ export function serializeRecord(row: StoredRecord): SerializedRecord {
   };
 }
 
-// ---- drift meta side-channel ------------------------------------------------
+// ---- response-meta side-channel ---------------------------------------------
 //
-// `get`/`update` keep returning the FLAT SerializedRecord (callers read `record.title`; route tests
-// mock flat returns). Per-read drift belongs in the response ENVELOPE's `meta`, not inside `data`,
-// so we cannot stuff it into the flat object. We attach it on a non-enumerable Symbol key: invisible
-// to spread, JSON, and deep-equality (so conforming responses stay byte-identical to Phase 4), but
-// reachable by the route, which lifts it into `meta`. Absent symbol -> undefined -> no `meta` key.
+// `get`/`create`/`update`/`delete` keep returning their FLAT result (callers read `record.title`;
+// route tests mock flat returns). Per-request envelope `meta` — Phase 5 drift, Phase 6 workflow
+// summary — belongs in the response ENVELOPE's `meta`, not inside `data`, so we cannot stuff it into
+// the result. We carry it on a non-enumerable Symbol key: invisible to spread, JSON, and deep-equality
+// (so clean responses stay byte-identical to Phase 4/5), but reachable by the route, which lifts it
+// into `meta`. Absent symbol -> undefined -> no `meta` key. Multiple producers MERGE into one object.
 
-const DRIFT_META = Symbol("recordDriftMeta");
+const RESPONSE_META = Symbol("recordResponseMeta");
 
-type WithDriftMeta = { [DRIFT_META]?: Record<string, unknown> };
+type WithResponseMeta = { [RESPONSE_META]?: Record<string, unknown> };
 
-/** Attach envelope-`meta` for a drifted read; returns the same record for chaining. */
-export function attachDriftMeta(record: SerializedRecord, meta: Record<string, unknown>): SerializedRecord {
-  Object.defineProperty(record, DRIFT_META, { value: meta, enumerable: false, configurable: true });
+/** Merge a partial into the result's response-meta (creating it if absent); returns the same object. */
+export function attachResponseMeta<T extends object>(record: T, partial: Record<string, unknown>): T {
+  const existing = readResponseMeta(record) ?? {};
+  Object.defineProperty(record, RESPONSE_META, {
+    value: { ...existing, ...partial },
+    enumerable: false,
+    configurable: true,
+  });
   return record;
 }
 
-/** Read the drift meta the service attached, or `undefined` for a clean (or externally-built) record. */
-export function readDriftMeta(record: SerializedRecord): Record<string, unknown> | undefined {
-  return (record as SerializedRecord & WithDriftMeta)[DRIFT_META];
+/** Read the merged response-meta, or `undefined` for a clean (or externally-built) result. */
+export function readResponseMeta<T extends object>(record: T): Record<string, unknown> | undefined {
+  return (record as T & WithResponseMeta)[RESPONSE_META];
 }
+
+/** Phase 5 drift meta is just response meta — kept as a named alias for clarity at call sites. */
+export function attachDriftMeta(record: SerializedRecord, meta: Record<string, unknown>): SerializedRecord {
+  return attachResponseMeta(record, meta);
+}
+export const readDriftMeta = readResponseMeta;

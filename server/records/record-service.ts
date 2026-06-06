@@ -11,8 +11,9 @@ import { buildEntityValidator } from "@/server/validation/build-validator";
 import { baseFieldSchema } from "@/server/validation/field-schemas";
 import { projectRecordData, type DriftNote, type ProjectionResult } from "./project";
 import type { ListQuery, RecordRepository, SortableField, StoredRecord } from "./record-repository";
-import { attachDriftMeta, serializeRecord, type SerializedRecord } from "./serialize";
+import { attachDriftMeta, attachResponseMeta, serializeRecord, type SerializedRecord } from "./serialize";
 import { toStoredData, toStoredRepr } from "./value-repr";
+import type { WorkflowDispatcher, WorkflowRunContext } from "@/server/workflows/types";
 
 /** Narrow reader (not the whole ConfigService): the active normalized config + its version. */
 export interface ActiveConfigReader {
@@ -33,15 +34,29 @@ interface ResolveInput {
 }
 
 export class RecordService {
+  /** Injected AFTER construction (composition root) to break the RecordService<->Runner cycle. */
+  private workflows?: WorkflowDispatcher;
+
   constructor(
     private readonly config: ActiveConfigReader,
     private readonly repo: RecordRepository,
   ) {}
 
+  /** Wire the post-commit workflow runner. Omitted in tests that don't exercise workflows -> no-op. */
+  setWorkflowRunner(runner: WorkflowDispatcher): void {
+    this.workflows = runner;
+  }
+
   // ---- create ---------------------------------------------------------------
 
-  async create(input: { ownerId: string; appId: string; entity: string; body: unknown }): Promise<SerializedRecord> {
-    const { entityDef, version } = await this.resolve(input);
+  async create(input: {
+    ownerId: string;
+    appId: string;
+    entity: string;
+    body: unknown;
+    depth?: number; // internal: >0 when created by a cascading workflow (route always passes 0/omit)
+  }): Promise<SerializedRecord> {
+    const { config, entityDef, version } = await this.resolve(input);
 
     const result = buildEntityValidator(entityDef).validate(input.body, "create");
     if (!result.ok) {
@@ -60,7 +75,14 @@ export class RecordService {
       data: toStoredData(result.data), // persist in stored representation (dates -> ISO), by construction
       version,
     });
-    return serializeRecord(row);
+    const serialized = serializeRecord(row);
+
+    // Post-commit, best-effort: workflows can never fail or roll back this write.
+    await this.runWorkflows(
+      { ownerId: input.ownerId, appId: input.appId, config, version, event: "onCreate", entity: input.entity, record: serialized, depth: input.depth ?? 0 },
+      serialized,
+    );
+    return serialized;
   }
 
   // ---- get ------------------------------------------------------------------
@@ -125,7 +147,7 @@ export class RecordService {
     id: string;
     body: unknown;
   }): Promise<SerializedRecord> {
-    const { entityDef, version } = await this.resolve(input);
+    const { config, entityDef, version } = await this.resolve(input);
 
     const existing = await this.repo.getById({
       appId: input.appId,
@@ -164,13 +186,30 @@ export class RecordService {
     });
     if (!row) throw new AppError("NOT_FOUND", "Record not found");
     // Report the existing row's drift so the caller learns it was migrated-on-write.
-    return this.withDrift(serializeRecord(row), projected.notes, existing.version, version);
+    const serialized = this.withDrift(serializeRecord(row), projected.notes, existing.version, version);
+
+    const previous = serializeRecord({ ...existing, data: projected.data });
+    await this.runWorkflows(
+      { ownerId: input.ownerId, appId: input.appId, config, version, event: "onUpdate", entity: input.entity, record: serialized, previous, depth: 0 },
+      serialized,
+    );
+    return serialized;
   }
 
   // ---- delete ---------------------------------------------------------------
 
   async delete(input: { ownerId: string; appId: string; entity: string; id: string }): Promise<{ id: string }> {
-    await this.resolve(input);
+    const { config, entityDef, version } = await this.resolve(input);
+
+    // Capture last-known data BEFORE deleting, so onDelete workflows receive the record's final state.
+    const existing = await this.repo.getById({
+      appId: input.appId,
+      entity: input.entity,
+      ownerId: input.ownerId,
+      id: input.id,
+    });
+    if (!existing) throw new AppError("NOT_FOUND", "Record not found");
+
     const deleted = await this.repo.delete({
       appId: input.appId,
       entity: input.entity,
@@ -178,10 +217,36 @@ export class RecordService {
       id: input.id,
     });
     if (!deleted) throw new AppError("NOT_FOUND", "Record not found");
-    return { id: input.id };
+
+    const result = { id: input.id };
+    const projected = this.project(existing, entityDef, version);
+    const lastKnown = serializeRecord({ ...existing, data: projected.data });
+    await this.runWorkflows(
+      { ownerId: input.ownerId, appId: input.appId, config, version, event: "onDelete", entity: input.entity, record: lastKnown, depth: 0 },
+      result,
+    );
+    return result;
   }
 
   // ---- internals ------------------------------------------------------------
+
+  /**
+   * Post-commit workflow hook. Best-effort and isolated: the runner never throws, but we still wrap
+   * defensively so no workflow outcome can ever alter or fail the already-committed CRUD response.
+   * Attaches a bounded `meta.workflows` summary (counts only) when any workflow produced a log entry.
+   */
+  private async runWorkflows(ctx: WorkflowRunContext, response: object): Promise<void> {
+    if (!this.workflows) return; // no runner wired (e.g. unit tests) -> exact Phase 5 behavior
+    try {
+      const { entries } = await this.workflows.run(ctx);
+      if (entries.length === 0) return; // no matching workflows -> no meta, identical to Phase 5
+      const summary = { ran: 0, skipped: 0, failed: 0 };
+      for (const e of entries) summary[e.status] += 1;
+      attachResponseMeta(response, { workflows: summary });
+    } catch {
+      // Unreachable by contract (the runner never throws), but the write must survive regardless.
+    }
+  }
 
   /**
    * Project a stored row onto the current schema. Fast-path: a row written under the active version

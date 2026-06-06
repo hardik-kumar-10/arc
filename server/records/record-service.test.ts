@@ -9,8 +9,12 @@ import { AppError } from "@/server/http/errors";
 import type { AppConfig } from "@/server/config/types";
 import { RecordService, type ActiveConfigReader } from "./record-service";
 import type { ListQuery, RecordRepository, StoredRecord } from "./record-repository";
-import { readDriftMeta } from "./serialize";
+import { readDriftMeta, readResponseMeta } from "./serialize";
 import type { DriftNote } from "./project";
+import { RecordServiceWorkflowWriter } from "@/server/workflows/record-writer";
+import { WorkflowRunner } from "@/server/workflows/runner";
+import { builtinActions } from "@/server/workflows/actions";
+import type { WorkflowHttpClient } from "@/server/workflows/types";
 
 const APP_ID = "app_1";
 const ACTIVE_VERSION = 3;
@@ -544,5 +548,109 @@ describe("Phase 5 drift tolerance", () => {
     await expect(
       v3.get({ ownerId: USER_A, appId: APP_ID, entity: ENTITY, id: created.id }),
     ).rejects.toMatchObject({ code: "ENTITY_UNKNOWN" });
+  });
+});
+
+// ---- Phase 6: workflow runner (real runner over in-memory writers) ----------
+//
+// A real WorkflowRunner + builtin actions are wired over the in-memory repo via the
+// RecordServiceWorkflowWriter, with a stub HTTP client. No DB, no network. The overriding invariant:
+// no workflow outcome ever alters or rolls back the CRUD response.
+
+type WfSummary = { ran: number; skipped: number; failed: number };
+const workflowsOf = (result: object): WfSummary | undefined =>
+  readResponseMeta(result)?.workflows as WfSummary | undefined;
+
+const stubHttp = (status: number): WorkflowHttpClient => ({
+  async post() {
+    return { status };
+  },
+});
+
+/** Wire a RecordService with a real runner over the given config + http stub. */
+function wireWorkflows(config: AppConfig, http: WorkflowHttpClient = stubHttp(200)) {
+  const wfRepo = makeRepo();
+  const service = new RecordService(stubReader(config), wfRepo);
+  const writer = new RecordServiceWorkflowWriter(service, wfRepo);
+  service.setWorkflowRunner(new WorkflowRunner(builtinActions, writer, http));
+  return service;
+}
+
+describe("Phase 6 workflow runner", () => {
+  const TASK_AUDIT: AppConfig = {
+    app: { name: "WF" },
+    entities: [
+      { name: "Task", fields: [{ name: "title", type: "string", required: true }, { name: "done", type: "boolean", default: false }] },
+      { name: "Audit", fields: [{ name: "msg", type: "string", required: true }] },
+    ],
+    workflows: [
+      { trigger: { event: "onCreate", entity: "Task" }, actions: [{ type: "createRecord", entity: "Audit", data: { msg: "created" } }] },
+    ],
+    pages: [],
+  };
+
+  it("onCreate workflow with createRecord creates the secondary record", async () => {
+    const svc = wireWorkflows(TASK_AUDIT);
+    const created = await svc.create({ ownerId: USER_A, appId: APP_ID, entity: "Task", body: { title: "Hi" } });
+
+    expect(created.title).toBe("Hi"); // CRUD response unaffected
+    expect(workflowsOf(created)).toEqual({ ran: 1, skipped: 0, failed: 0 });
+
+    const audits = await svc.list({ ownerId: USER_A, appId: APP_ID, entity: "Audit", searchParams: sp() });
+    expect(audits.items).toHaveLength(1);
+    expect(audits.items[0].msg).toBe("created");
+  });
+
+  it("a failing workflow action does NOT fail the originating write; meta.workflows.failed reflects it", async () => {
+    const config: AppConfig = {
+      ...TASK_AUDIT,
+      workflows: [{ trigger: { event: "onCreate", entity: "Task" }, actions: [{ type: "webhook", url: "https://x.test/hook" }] }],
+    };
+    const svc = wireWorkflows(config, stubHttp(500)); // webhook -> non-2xx -> failed action
+
+    const created = await svc.create({ ownerId: USER_A, appId: APP_ID, entity: "Task", body: { title: "Survives" } });
+    expect(created.title).toBe("Survives"); // record still created and returned
+    expect(workflowsOf(created)).toEqual({ ran: 0, skipped: 0, failed: 1 });
+
+    const list = await svc.list({ ownerId: USER_A, appId: APP_ID, entity: "Task", searchParams: sp() });
+    expect(list.items).toHaveLength(1); // persisted despite the failure
+  });
+
+  it("a setField workflow updates the triggering record without infinite-looping", async () => {
+    const config: AppConfig = {
+      ...TASK_AUDIT,
+      workflows: [{ trigger: { event: "onUpdate", entity: "Task" }, actions: [{ type: "setField", field: "done", value: true }] }],
+    };
+    const svc = wireWorkflows(config);
+
+    const created = await svc.create({ ownerId: USER_A, appId: APP_ID, entity: "Task", body: { title: "T" } });
+    expect(created.done).toBe(false);
+
+    const updated = await svc.update({ ownerId: USER_A, appId: APP_ID, entity: "Task", id: created.id, body: { title: "T2" } });
+    expect(workflowsOf(updated)).toEqual({ ran: 1, skipped: 0, failed: 0 }); // ran once, no re-fire loop
+
+    const reread = await svc.get({ ownerId: USER_A, appId: APP_ID, entity: "Task", id: created.id });
+    expect(reread.title).toBe("T2");
+    expect(reread.done).toBe(true); // silent setField applied
+  });
+
+  it("onDelete setField is gracefully skipped; delete still returns { id }", async () => {
+    const config: AppConfig = {
+      ...TASK_AUDIT,
+      workflows: [{ trigger: { event: "onDelete", entity: "Task" }, actions: [{ type: "setField", field: "done", value: true }] }],
+    };
+    const svc = wireWorkflows(config);
+    const created = await svc.create({ ownerId: USER_A, appId: APP_ID, entity: "Task", body: { title: "Doomed" } });
+
+    const del = await svc.delete({ ownerId: USER_A, appId: APP_ID, entity: "Task", id: created.id });
+    expect(del).toEqual({ id: created.id });
+    expect(workflowsOf(del)).toEqual({ ran: 0, skipped: 1, failed: 0 });
+  });
+
+  it("a config with no workflows behaves identically to Phase 5 (no-op runner)", async () => {
+    const config: AppConfig = { ...TASK_AUDIT, workflows: [] };
+    const svc = wireWorkflows(config);
+    const created = await svc.create({ ownerId: USER_A, appId: APP_ID, entity: "Task", body: { title: "Plain" } });
+    expect(readResponseMeta(created)).toBeUndefined(); // no meta attached at all
   });
 });
